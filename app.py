@@ -4,7 +4,6 @@ import numpy as np
 import pyqtgraph as pg
 import matplotlib
 import matplotlib.pyplot as plt
-import ccxt
 from PyQt5.QtWidgets import QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QLabel
 from PyQt5.QtCore import QTimer, Qt, QThread, pyqtSignal
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
@@ -19,7 +18,7 @@ from ml_model import TopoBooster
 
 
 class WorkerThread(QThread):
-    data_ready = pyqtSignal(list, list, float, np.ndarray)
+    data_ready = pyqtSignal(list, list, float, np.ndarray, float)
     error_occurred = pyqtSignal(str)
 
     def __init__(self, feeder, tda, ml, symbol, timeframe, tau, dim, prices, timestamps, stress_history):
@@ -35,6 +34,7 @@ class WorkerThread(QThread):
         self.timestamps = timestamps
         self.stress_history = stress_history
         self.running = True
+        self.prob_history = []
 
     def run(self):
         while self.running:
@@ -56,16 +56,21 @@ class WorkerThread(QThread):
                         self.stress_history = self.stress_history[-500:]
 
                     embedded_data = self.get_takens_embedding()
+                    current_stress = 0.0
 
                     if len(embedded_data) > 0:
-                        stress = self.tda.get_topological_stress(embedded_data[-50:])
-                        self.stress_history[-1] = stress
+                        current_stress = self.tda.get_topological_stress(embedded_data[-50:])
+                        self.stress_history[-1] = current_stress
 
                         prob_up = 0.5
                         if self.ml.is_trained:
-                            prob_up = self.ml.predict(self.prices, self.stress_history)
+                            raw_prob = self.ml.predict(self.prices, self.stress_history)
+                            self.prob_history.append(raw_prob)
+                            if len(self.prob_history) > 5:
+                                self.prob_history.pop(0)
+                            prob_up = sum(self.prob_history) / len(self.prob_history)
 
-                        self.data_ready.emit(self.prices, self.stress_history, prob_up, embedded_data)
+                        self.data_ready.emit(self.prices, self.stress_history, prob_up, embedded_data, current_stress)
 
             except Exception as e:
                 self.error_occurred.emit(str(e))
@@ -100,6 +105,9 @@ class TopoAlphaEngine(QMainWindow):
         self.tda = TDAAnalyzer()
         self.ml = TopoBooster()
 
+        self.alpha_stress_threshold = 1.5
+        self.active_trade_horizon = None
+
         self.init_ui()
         self.preload_data()
 
@@ -125,11 +133,33 @@ class TopoAlphaEngine(QMainWindow):
         self.plot_price = pg.PlotWidget(title=f"Live Price: {self.symbol}")
         self.plot_price.showGrid(x=True, y=True)
         self.price_curve = self.plot_price.plot(pen=pg.mkPen('g', width=2))
+
+        self.horizon_line = pg.InfiniteLine(angle=90, pen=pg.mkPen('y', width=2, style=Qt.DashLine))
+        self.horizon_line.hide()
+        self.plot_price.addItem(self.horizon_line)
+
         left_layout.addWidget(self.plot_price, stretch=2)
 
-        self.plot_stress = pg.PlotWidget(title="Live Topological Stress (H1 Max Persistence)")
+        self.buy_scatter = pg.ScatterPlotItem(size=14, pen=pg.mkPen(None), brush=pg.mkBrush(0, 255, 0, 255),
+                                              symbol='t1')
+        self.sell_scatter = pg.ScatterPlotItem(size=14, pen=pg.mkPen(None), brush=pg.mkBrush(255, 0, 0, 255),
+                                               symbol='t')
+        self.plot_price.addItem(self.buy_scatter)
+        self.plot_price.addItem(self.sell_scatter)
+
+        self.buy_markers_x = []
+        self.buy_markers_y = []
+        self.sell_markers_x = []
+        self.sell_markers_y = []
+
+        self.plot_stress = pg.PlotWidget(title="Live Topological Stress (Alpha Finder)")
         self.plot_stress.showGrid(x=True, y=True)
         self.stress_curve = self.plot_stress.plot(pen=pg.mkPen('r', width=2), fillLevel=0, brush=(255, 0, 0, 50))
+
+        self.stress_threshold_line = pg.InfiniteLine(pos=self.alpha_stress_threshold, angle=0,
+                                                     pen=pg.mkPen('m', width=2, style=Qt.DashLine))
+        self.plot_stress.addItem(self.stress_threshold_line)
+
         left_layout.addWidget(self.plot_stress, stretch=1)
 
         left_widget = QWidget()
@@ -145,14 +175,12 @@ class TopoAlphaEngine(QMainWindow):
         layout.addWidget(self.canvas, stretch=1)
 
     def preload_data(self):
-        print(f"Loading history via Robust Feeder...")
         ohlcv = self.feeder.fetch_initial(limit=500)
         for candle in ohlcv:
             self.timestamps.append(candle[0])
             self.prices.append(candle[4])
             self.stress_history.append(0.0)
 
-        print("Backfilling topological features...")
         for i in range(350, len(self.prices)):
             window = self.prices[i - 50:i]
             data = np.array(window)
@@ -163,29 +191,63 @@ class TopoAlphaEngine(QMainWindow):
 
         self.ml.train(self.prices, self.stress_history)
 
-    def update_ui(self, prices, stress_history, prob_up, embedded_data):
+    def update_ui(self, prices, stress_history, prob_up, embedded_data, current_stress):
         self.price_curve.setData(prices)
         self.stress_curve.setData(stress_history)
 
-        if prob_up > 0.55:
-            self.signal_label.setText(f"🚀 BUY / LONG (UP Prob: {prob_up:.1%})")
-            self.signal_label.setStyleSheet(
-                "color: #00FF00; font-size: 28px; font-weight: bold; background-color: #002200;")
-        elif prob_up < 0.45:
-            self.signal_label.setText(f"🩸 SELL / SHORT (UP Prob: {prob_up:.1%})")
-            self.signal_label.setStyleSheet(
-                "color: #FF0000; font-size: 28px; font-weight: bold; background-color: #220000;")
+        current_x = len(prices) - 1
+        current_price = prices[-1]
+
+        if self.active_trade_horizon and current_x >= self.active_trade_horizon:
+            self.active_trade_horizon = None
+            self.horizon_line.hide()
+
+        if current_stress >= self.alpha_stress_threshold:
+            alpha_status = "🔥 TOPOLOGY BROKEN! ALPHA FOUND!"
+            bg_color = "#330033"
         else:
-            self.signal_label.setText(f"⚖️ NEUTRAL (UP Prob: {prob_up:.1%})")
+            alpha_status = "Topology Stable."
+            bg_color = "#111111"
+
+        if prob_up >= 0.60 and current_stress >= self.alpha_stress_threshold:
+            self.signal_label.setText(f"🚀 EXECUTING LONG (UP Prob: {prob_up:.1%}) | {alpha_status}")
             self.signal_label.setStyleSheet(
-                "color: #FFFF00; font-size: 28px; font-weight: bold; background-color: #222200;")
+                f"color: #00FF00; font-size: 24px; font-weight: bold; background-color: {bg_color};")
+
+            if len(self.buy_markers_x) == 0 or current_x > self.buy_markers_x[-1]:
+                self.buy_markers_x.append(current_x)
+                self.buy_markers_y.append(current_price * 0.9995)
+                self.active_trade_horizon = current_x + 5
+                self.horizon_line.setPos(self.active_trade_horizon)
+                self.horizon_line.show()
+
+        elif prob_up <= 0.40 and current_stress >= self.alpha_stress_threshold:
+            self.signal_label.setText(f"🩸 EXECUTING SHORT (UP Prob: {prob_up:.1%}) | {alpha_status}")
+            self.signal_label.setStyleSheet(
+                f"color: #FF0000; font-size: 24px; font-weight: bold; background-color: {bg_color};")
+
+            if len(self.sell_markers_x) == 0 or current_x > self.sell_markers_x[-1]:
+                self.sell_markers_x.append(current_x)
+                self.sell_markers_y.append(current_price * 1.0005)
+                self.active_trade_horizon = current_x + 5
+                self.horizon_line.setPos(self.active_trade_horizon)
+                self.horizon_line.show()
+
+        else:
+            self.signal_label.setText(f"⚖️ WAITING FOR ALPHA (UP Prob: {prob_up:.1%}) | {alpha_status}")
+            self.signal_label.setStyleSheet(
+                f"color: #FFFF00; font-size: 24px; font-weight: bold; background-color: {bg_color};")
+
+        self.buy_scatter.setData(self.buy_markers_x, self.buy_markers_y)
+        self.sell_scatter.setData(self.sell_markers_x, self.sell_markers_y)
 
         self.ax.clear()
         self.ax.set_title('3D Market Attractor', color='white')
         self.ax.grid(True, color='#333333')
-        c = np.linspace(0, 1, len(embedded_data))
-        self.ax.scatter(embedded_data[:, 0], embedded_data[:, 1], embedded_data[:, 2], c=c, cmap='cool', s=10,
-                        alpha=0.8)
+        if len(embedded_data) > 0:
+            c = np.linspace(0, 1, len(embedded_data))
+            self.ax.scatter(embedded_data[:, 0], embedded_data[:, 1], embedded_data[:, 2], c=c, cmap='cool', s=10,
+                            alpha=0.8)
         self.canvas.draw()
 
     def closeEvent(self, event):
