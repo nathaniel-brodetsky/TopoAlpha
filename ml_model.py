@@ -33,7 +33,11 @@ class TopoBooster:
             df[f'return_lag_{i}'] = df['returns'].shift(i)
             df[f'stress_lag_{i}'] = df['stress'].shift(i)
 
-        df['target'] = (df['returns'].shift(-1) > 0).astype(int)
+        horizon = 5
+
+        df[f'future_return_{horizon}'] = df['close'].shift(-horizon) / df['close'] - 1
+
+        df['target'] = (df[f'future_return_{horizon}'] > 0.0005).astype(int)
 
         df.dropna(inplace=True)
         return df
@@ -45,12 +49,12 @@ class TopoBooster:
 
         df = self.prepare_features(prices, stress_history)
 
-        X = df.drop(['close', 'target'], axis=1)
+        X = df.drop(['close', 'target', f'future_return_5'], axis=1, errors='ignore')
         y = df['target']
 
         self.model.fit(X, y)
         self.is_trained = True
-        print(f"Model trained on {len(X)} samples. Ready for inference.")
+        print(f"Model trained on {len(X)} samples (Horizon: 5 candles). Ready for inference.")
         return True
 
     def predict(self, current_prices, current_stress):
@@ -61,7 +65,7 @@ class TopoBooster:
         if len(df) == 0:
             return 0.5
 
-        last_X = df.drop(['close', 'target'], axis=1).iloc[-1:]
+        last_X = df.drop(['close', 'target', f'future_return_5'], axis=1, errors='ignore').iloc[-1:]
 
         prob_up = self.model.predict_proba(last_X)[0][1]
         return prob_up

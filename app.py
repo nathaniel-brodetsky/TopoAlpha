@@ -15,6 +15,7 @@ plt.style.use('dark_background')
 from data_feeder import RobustDataFeeder
 from tda_core import TDAAnalyzer
 from ml_model import TopoBooster
+from paper_trader import PaperTrader
 
 
 class WorkerThread(QThread):
@@ -104,6 +105,7 @@ class TopoAlphaEngine(QMainWindow):
         self.dim = 3
         self.tda = TDAAnalyzer()
         self.ml = TopoBooster()
+        self.trader = PaperTrader(initial_balance=10000.0, horizon=5)
 
         self.alpha_stress_threshold = 1.5
         self.active_trade_horizon = None
@@ -123,6 +125,12 @@ class TopoAlphaEngine(QMainWindow):
         self.setCentralWidget(central_widget)
         layout = QHBoxLayout(central_widget)
         left_layout = QVBoxLayout()
+
+        self.portfolio_label = QLabel("BALANCE: $10000.00 | PNL: 0.00% | POS: NONE")
+        self.portfolio_label.setStyleSheet(
+            "color: #00FFFF; font-size: 20px; font-weight: bold; padding: 5px; background-color: #001122; border-radius: 5px;")
+        self.portfolio_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        left_layout.addWidget(self.portfolio_label)
 
         self.signal_label = QLabel("ML STATUS: INITIALIZING...")
         self.signal_label.setStyleSheet(
@@ -198,9 +206,18 @@ class TopoAlphaEngine(QMainWindow):
         current_x = len(prices) - 1
         current_price = prices[-1]
 
-        if self.active_trade_horizon and current_x >= self.active_trade_horizon:
+        trade_result = self.trader.update(current_price, current_x)
+        if trade_result:
             self.active_trade_horizon = None
             self.horizon_line.hide()
+            print(f"TRADE CLOSED: {trade_result}")
+
+        unrealized_pnl = self.trader.get_unrealized_pnl(current_price)
+        pos_str = self.trader.position if self.trader.position else "NONE"
+        pnl_color = "#00FF00" if unrealized_pnl >= 0 else "#FF0000"
+
+        self.portfolio_label.setText(
+            f"BALANCE: ${self.trader.balance:.2f} | PNL: <font color='{pnl_color}'>{unrealized_pnl:.3f}%</font> | POS: {pos_str}")
 
         if current_stress >= self.alpha_stress_threshold:
             alpha_status = "🔥 TOPOLOGY BROKEN! ALPHA FOUND!"
@@ -209,24 +226,24 @@ class TopoAlphaEngine(QMainWindow):
             alpha_status = "Topology Stable."
             bg_color = "#111111"
 
-        if prob_up >= 0.60 and current_stress >= self.alpha_stress_threshold:
+        if prob_up >= 0.60 and current_stress >= self.alpha_stress_threshold and self.trader.position is None:
             self.signal_label.setText(f"🚀 EXECUTING LONG (UP Prob: {prob_up:.1%}) | {alpha_status}")
             self.signal_label.setStyleSheet(
                 f"color: #00FF00; font-size: 24px; font-weight: bold; background-color: {bg_color};")
 
-            if len(self.buy_markers_x) == 0 or current_x > self.buy_markers_x[-1]:
+            if self.trader.execute_trade('LONG', current_price, current_x):
                 self.buy_markers_x.append(current_x)
                 self.buy_markers_y.append(current_price * 0.9995)
                 self.active_trade_horizon = current_x + 5
                 self.horizon_line.setPos(self.active_trade_horizon)
                 self.horizon_line.show()
 
-        elif prob_up <= 0.40 and current_stress >= self.alpha_stress_threshold:
+        elif prob_up <= 0.40 and current_stress >= self.alpha_stress_threshold and self.trader.position is None:
             self.signal_label.setText(f"🩸 EXECUTING SHORT (UP Prob: {prob_up:.1%}) | {alpha_status}")
             self.signal_label.setStyleSheet(
                 f"color: #FF0000; font-size: 24px; font-weight: bold; background-color: {bg_color};")
 
-            if len(self.sell_markers_x) == 0 or current_x > self.sell_markers_x[-1]:
+            if self.trader.execute_trade('SHORT', current_price, current_x):
                 self.sell_markers_x.append(current_x)
                 self.sell_markers_y.append(current_price * 1.0005)
                 self.active_trade_horizon = current_x + 5
