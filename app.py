@@ -8,7 +8,7 @@ from PyQt5.QtWidgets import QApplication, QMainWindow, QWidget, QHBoxLayout, QVB
 from PyQt5.QtCore import QTimer, Qt, QThread, pyqtSignal
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 
-os.environ["QT_QPA_PLATFORM"] = "xcb"
+
 matplotlib.use('Qt5Agg')
 plt.style.use('dark_background')
 
@@ -115,7 +115,10 @@ class TopoAlphaEngine(QMainWindow):
 
         self.worker = WorkerThread(self.feeder, self.tda, self.ml, self.symbol, self.timeframe,
                                    self.tau, self.dim, self.prices, self.timestamps, self.stress_history)
+
         self.worker.data_ready.connect(self.update_ui)
+        self.worker.error_occurred.connect(lambda err: print(f"⚠️ ОШИБКА ПОТОКА: {err}"))
+
         self.worker.start()
 
     def init_ui(self):
@@ -184,6 +187,10 @@ class TopoAlphaEngine(QMainWindow):
 
     def preload_data(self):
         ohlcv = self.feeder.fetch_initial(limit=500)
+        if not ohlcv:
+            print("⚠️ Не удалось загрузить начальные данные!")
+            return
+
         for candle in ohlcv:
             self.timestamps.append(candle[0])
             self.prices.append(candle[4])
@@ -263,9 +270,10 @@ class TopoAlphaEngine(QMainWindow):
         self.ax.grid(True, color='#333333')
         if len(embedded_data) > 0:
             c = np.linspace(0, 1, len(embedded_data))
-            self.ax.scatter(embedded_data[:, 0], embedded_data[:, 1], embedded_data[:, 2], c=c, cmap='cool', s=10,
-                            alpha=0.8)
-        self.canvas.draw()
+            self.ax.scatter(embedded_data[:, 0], embedded_data[:, 1], embedded_data[:, 2],
+                            c=c, cmap='cool', s=10, alpha=0.8)
+
+        self.canvas.draw_idle()
 
     def closeEvent(self, event):
         self.worker.stop()
@@ -276,4 +284,4 @@ if __name__ == '__main__':
     app = QApplication(sys.argv)
     engine = TopoAlphaEngine()
     engine.show()
-    sys.exit(app.exec())
+    sys.exit(app.exec_())
