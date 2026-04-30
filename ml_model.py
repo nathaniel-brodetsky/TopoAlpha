@@ -37,7 +37,7 @@ class TopoBooster:
 
         df[f'future_return_{horizon}'] = df['close'].shift(-horizon) / df['close'] - 1
 
-        df['target'] = (df[f'future_return_{horizon}'] > 0.0005).astype(int)
+        df['target'] = (df[f'future_return_{horizon}'] > 0.0001).astype(int)
 
         df.dropna(inplace=True)
         return df
