@@ -43,24 +43,16 @@ class BinanceDemoExecutor:
                 logger.error("[BINANCE API] Trade size too small.")
                 return False
 
-            logger.info(f"[BINANCE API] Sending MARKET {order_side} order: {amount_coins} {self.symbol}")
-
             self.client.futures_create_order(
                 symbol=self.symbol,
                 side=order_side,
                 type='MARKET',
                 quantity=amount_coins
             )
+            logger.info(f"[BINANCE API] MARKET {order_side} FILLED: {amount_coins} {self.symbol}")
 
-            if side == 'LONG':
-                sl_price = current_price * (1 - sl_pct)
-                tp_price = current_price * (1 + tp_pct)
-            else:
-                sl_price = current_price * (1 + sl_pct)
-                tp_price = current_price * (1 - tp_pct)
-
-            sl_price = round(sl_price, 1)
-            tp_price = round(tp_price, 1)
+            sl_price = round(current_price * (1 - sl_pct) if side == 'LONG' else current_price * (1 + sl_pct), 1)
+            tp_price = round(current_price * (1 + tp_pct) if side == 'LONG' else current_price * (1 - tp_pct), 1)
 
             self.client.futures_create_order(
                 symbol=self.symbol,
@@ -77,10 +69,28 @@ class BinanceDemoExecutor:
                 stopPrice=tp_price,
                 closePosition=True
             )
-
-            logger.info(f"[BINANCE API] SL set at {sl_price} | TP set at {tp_price}")
+            logger.info(f"[BINANCE API] SL: {sl_price} | TP: {tp_price}")
             return True
 
         except Exception as e:
             logger.error(f"[BINANCE API] Execution failed: {e}")
             return False
+
+    def close_all_positions_and_orders(self):
+        try:
+            self.client.futures_cancel_all_open_orders(symbol=self.symbol)
+
+            positions = self.client.futures_position_information(symbol=self.symbol)
+            for pos in positions:
+                amt = float(pos['positionAmt'])
+                if amt != 0:
+                    side = 'SELL' if amt > 0 else 'BUY'
+                    self.client.futures_create_order(
+                        symbol=self.symbol,
+                        side=side,
+                        type='MARKET',
+                        quantity=abs(amt)
+                    )
+                    logger.info(f"[BINANCE API] Position closed via MARKET {side}: {abs(amt)} {self.symbol}")
+        except Exception as e:
+            logger.error(f"[BINANCE API] Close position error: {e}")

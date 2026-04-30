@@ -26,7 +26,7 @@ class MarketStreamer(QThread):
     data_ready = pyqtSignal(list, list, list, float, np.ndarray, float)
     error_occurred = pyqtSignal(str)
 
-    def __init__(self, feeder, tda, ml, tau, dim, prices, timestamps, stress_history):
+    def __init__(self, feeder, tda, ml, tau, dim, prices, timestamps, stress_history, obi_history):
         super().__init__()
         self.feeder = feeder
         self.tda = tda
@@ -36,13 +36,17 @@ class MarketStreamer(QThread):
         self.prices = prices
         self.timestamps = timestamps
         self.stress_history = stress_history
+        self.obi_history = obi_history
         self.running = True
         self.prob_history = []
+        self.tick_counter = 0
 
     def run(self):
         while self.running:
             try:
                 ohlcv = self.feeder.fetch_updates()
+                obi = self.feeder.fetch_order_book_imbalance(depth=20)
+
                 if ohlcv:
                     for candle in ohlcv:
                         t, o, h, l, c, v = candle
@@ -50,13 +54,16 @@ class MarketStreamer(QThread):
                             self.timestamps.append(t)
                             self.prices.append(c)
                             self.stress_history.append(self.stress_history[-1] if self.stress_history else 0.0)
+                            self.obi_history.append(obi)
                         elif t == self.timestamps[-1]:
                             self.prices[-1] = c
+                            self.obi_history[-1] = obi
 
                     if len(self.prices) > 500:
                         self.timestamps = self.timestamps[-500:]
                         self.prices = self.prices[-500:]
                         self.stress_history = self.stress_history[-500:]
+                        self.obi_history = self.obi_history[-500:]
 
                     embedded_data = self._get_embedding()
                     current_stress = 0.0
@@ -67,7 +74,7 @@ class MarketStreamer(QThread):
                         self.stress_history[-1] = current_stress
 
                         if self.ml.is_trained:
-                            raw_prob = self.ml.predict(self.prices, self.stress_history)
+                            raw_prob = self.ml.predict(self.prices, self.stress_history, self.obi_history)
                             self.prob_history.append(raw_prob)
                             if len(self.prob_history) > 5:
                                 self.prob_history.pop(0)
@@ -81,6 +88,11 @@ class MarketStreamer(QThread):
                         embedded_data,
                         current_stress
                     )
+
+                self.tick_counter += 1
+                if self.tick_counter % 150 == 0 and len(self.prices) > 100:
+                    logger.info("Dynamic Retraining ML with recent Order Book Imbalance data...")
+                    self.ml.train(self.prices, self.stress_history, self.obi_history)
 
             except Exception as e:
                 self.error_occurred.emit(str(e))
@@ -177,16 +189,13 @@ class TopoAlphaEngine(QMainWindow):
         self.tda = TDAAnalyzer()
         self.ml = TopoBooster()
         self.trader = PaperTrader(initial_balance=10000.0, horizon=5)
-
-        self.api_executor = BinanceDemoExecutor(
-            symbol=self.symbol,
-            leverage=10,
-            margin_usdt=50.0
-        )
+        self.api_executor = BinanceDemoExecutor(symbol=self.symbol, leverage=10, margin_usdt=50.0)
 
         self.timestamps = []
         self.prices = []
         self.stress_history = []
+        self.obi_history = []
+
         self.absolute_candle_index = 0
         self.last_processed_time = 0
 
@@ -200,7 +209,7 @@ class TopoAlphaEngine(QMainWindow):
         self.worker = MarketStreamer(
             self.feeder, self.tda, self.ml,
             self.tau, self.dim,
-            self.prices, self.timestamps, self.stress_history
+            self.prices, self.timestamps, self.stress_history, self.obi_history
         )
         self.worker.data_ready.connect(self._update_interface)
         self.worker.start()
@@ -214,6 +223,7 @@ class TopoAlphaEngine(QMainWindow):
             self.timestamps.append(candle[0])
             self.prices.append(candle[4])
             self.stress_history.append(0.0)
+            self.obi_history.append(0.0)
 
         self.last_processed_time = self.timestamps[-1]
         self.absolute_candle_index = len(self.timestamps)
@@ -226,7 +236,7 @@ class TopoAlphaEngine(QMainWindow):
             if len(embedded) > 0:
                 self.stress_history[i] = self.tda.get_topological_stress(embedded)
 
-        self.ml.train(self.prices, self.stress_history)
+        self.ml.train(self.prices, self.stress_history, self.obi_history)
 
     def _update_interface(self, timestamps, prices, stress_history, prob_up, embedded_data, current_stress):
         times_sec = [t / 1000.0 for t in timestamps]
@@ -247,6 +257,7 @@ class TopoAlphaEngine(QMainWindow):
         res = self.trader.update(curr_p, self.absolute_candle_index)
         if res:
             logger.info(f"TRADE CLOSED: {res}")
+            self.api_executor.close_all_positions_and_orders()
             for l in [self.ui.horizon_line, self.ui.sl_line, self.ui.tp_line]:
                 l.hide()
 
@@ -261,10 +272,9 @@ class TopoAlphaEngine(QMainWindow):
             if prob_up >= 0.60:
                 if self.trader.execute_trade('LONG', curr_p, self.absolute_candle_index):
                     self.api_executor.execute_trade('LONG', curr_p, self.trader.sl_pct, self.trader.tp_pct)
-
                     logger.info(f"EXECUTING LONG at {curr_p}")
                     self.ui.buy_markers_x.append(curr_t)
-                    self.ui.buy_markers_y.append(curr_p * 0.9995)
+                    self.ui.buy_markers_y.append(curr_p)
                     self.ui.horizon_line.setPos(curr_t + 300)
                     self.ui.tp_line.setPos(curr_p * (1 + self.trader.tp_pct))
                     self.ui.sl_line.setPos(curr_p * (1 - self.trader.sl_pct))
@@ -273,10 +283,9 @@ class TopoAlphaEngine(QMainWindow):
             elif prob_up <= 0.40:
                 if self.trader.execute_trade('SHORT', curr_p, self.absolute_candle_index):
                     self.api_executor.execute_trade('SHORT', curr_p, self.trader.sl_pct, self.trader.tp_pct)
-
                     logger.info(f"EXECUTING SHORT at {curr_p}")
                     self.ui.sell_markers_x.append(curr_t)
-                    self.ui.sell_markers_y.append(curr_p * 1.0005)
+                    self.ui.sell_markers_y.append(curr_p)
                     self.ui.horizon_line.setPos(curr_t + 300)
                     self.ui.tp_line.setPos(curr_p * (1 - self.trader.tp_pct))
                     self.ui.sl_line.setPos(curr_p * (1 + self.trader.sl_pct))
