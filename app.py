@@ -23,7 +23,7 @@ logger = logging.getLogger("TopoAlpha")
 
 
 class MarketStreamer(QThread):
-    data_ready = pyqtSignal(list, list, list, float, np.ndarray, float)
+    data_ready = pyqtSignal(list, list, list, list, float, np.ndarray, float)
     error_occurred = pyqtSignal(str)
 
     def __init__(self, feeder, tda, ml, tau, dim, prices, timestamps, stress_history, obi_history):
@@ -84,6 +84,7 @@ class MarketStreamer(QThread):
                         self.timestamps,
                         self.prices,
                         self.stress_history,
+                        self.obi_history,
                         prob_up,
                         embedded_data,
                         current_stress
@@ -140,7 +141,7 @@ class DashboardUI(QWidget):
         self.plot_price = pg.PlotWidget(title=f"Live Price ({self.symbol})", axisItems={'bottom': pg.DateAxisItem()})
         self.plot_price.showGrid(x=True, y=True)
         self.price_curve = self.plot_price.plot(pen=pg.mkPen('g', width=2))
-        left_layout.addWidget(self.plot_price, stretch=2)
+        left_layout.addWidget(self.plot_price, stretch=3)
 
         self.plot_stress = pg.PlotWidget(title="Topological Stress", axisItems={'bottom': pg.DateAxisItem()})
         self.plot_stress.showGrid(x=True, y=True)
@@ -151,6 +152,16 @@ class DashboardUI(QWidget):
         self.stress_threshold_line = pg.InfiniteLine(pos=self.stress_threshold, angle=0,
                                                      pen=pg.mkPen('m', width=2, style=Qt.DashLine))
         self.plot_stress.addItem(self.stress_threshold_line)
+
+        self.plot_obi = pg.PlotWidget(title="Order Book Imbalance (-1 Bears to +1 Bulls)",
+                                      axisItems={'bottom': pg.DateAxisItem()})
+        self.plot_obi.showGrid(x=True, y=True)
+        self.obi_curve = self.plot_obi.plot(pen=pg.mkPen('c', width=2), fillLevel=0, brush=(0, 255, 255, 50))
+        self.plot_obi.setXLink(self.plot_price)
+
+        self.obi_zero_line = pg.InfiniteLine(pos=0.0, angle=0, pen=pg.mkPen('w', width=1, style=Qt.DashLine))
+        self.plot_obi.addItem(self.obi_zero_line)
+        left_layout.addWidget(self.plot_obi, stretch=1)
 
         self.buy_scatter = pg.ScatterPlotItem(size=14, brush=pg.mkBrush(0, 255, 0), symbol='t1')
         self.sell_scatter = pg.ScatterPlotItem(size=14, brush=pg.mkBrush(255, 0, 0), symbol='t')
@@ -202,7 +213,7 @@ class TopoAlphaEngine(QMainWindow):
         self.ui = DashboardUI(self.symbol, self.alpha_stress_threshold)
         self.setCentralWidget(self.ui)
         self.setWindowTitle(f"TopoAlpha Engine - {self.symbol}")
-        self.resize(1600, 900)
+        self.resize(1600, 950)
 
         self._preload_data()
 
@@ -238,11 +249,13 @@ class TopoAlphaEngine(QMainWindow):
 
         self.ml.train(self.prices, self.stress_history, self.obi_history)
 
-    def _update_interface(self, timestamps, prices, stress_history, prob_up, embedded_data, current_stress):
+    def _update_interface(self, timestamps, prices, stress_history, obi_history, prob_up, embedded_data,
+                          current_stress):
         times_sec = [t / 1000.0 for t in timestamps]
 
         self.ui.price_curve.setData(times_sec, prices)
         self.ui.stress_curve.setData(times_sec, stress_history)
+        self.ui.obi_curve.setData(times_sec, obi_history)
 
         curr_t = times_sec[-1]
         curr_p = prices[-1]
