@@ -1,14 +1,18 @@
 class PaperTrader:
-    def __init__(self, initial_balance=10000.0, horizon=5, sl_pct=0.002, tp_pct=0.004):
+    def __init__(self, initial_balance=10000.0, margin_usdt=50.0, leverage=10, horizon=5, sl_pct=0.002, tp_pct=0.004,
+                 fee_pct=0.0004):
         self.balance = initial_balance
-        self.initial_balance = initial_balance
-        self.position = None
-        self.entry_price = 0.0
-        self.entry_x = 0
+        self.margin_usdt = margin_usdt
+        self.leverage = leverage
         self.horizon = horizon
         self.sl_pct = sl_pct
         self.tp_pct = tp_pct
-        self.trade_history = list()
+        self.fee_pct = fee_pct
+
+        self.position = None
+        self.entry_price = 0.0
+        self.entry_x = 0
+        self.trade_history = []
 
     def execute_trade(self, signal, price, current_x):
         if self.position is not None:
@@ -23,17 +27,21 @@ class PaperTrader:
             return None
 
         if self.position == 'LONG':
-            pnl = (current_price - self.entry_price) / self.entry_price
+            pnl_pct = (current_price - self.entry_price) / self.entry_price
         else:
-            pnl = (self.entry_price - current_price) / self.entry_price
+            pnl_pct = (self.entry_price - current_price) / self.entry_price
 
-        hit_sl = pnl <= -self.sl_pct
-        hit_tp = pnl >= self.tp_pct
+        hit_sl = pnl_pct <= -self.sl_pct
+        hit_tp = pnl_pct >= self.tp_pct
         hit_time = current_x >= (self.entry_x + self.horizon)
 
         if hit_sl or hit_tp or hit_time:
-            profit_usd = self.balance * pnl
-            self.balance += profit_usd
+            pos_size_usd = self.margin_usdt * self.leverage
+            gross_profit = pos_size_usd * pnl_pct
+            total_fees = pos_size_usd * self.fee_pct * 2
+            net_profit = gross_profit - total_fees
+
+            self.balance += net_profit
 
             reason = "TIME"
             if hit_sl:
@@ -45,8 +53,7 @@ class PaperTrader:
                 'type': self.position,
                 'entry': self.entry_price,
                 'exit': current_price,
-                'pnl_pct': pnl * 100,
-                'profit_usd': profit_usd,
+                'net_profit_usd': net_profit,
                 'reason': reason
             }
             self.trade_history.append(trade_result)
@@ -61,7 +68,14 @@ class PaperTrader:
     def get_unrealized_pnl(self, current_price):
         if self.position is None:
             return 0.0
+
         if self.position == 'LONG':
-            return (current_price - self.entry_price) / self.entry_price * 100
+            pnl_pct = (current_price - self.entry_price) / self.entry_price
         else:
-            return (self.entry_price - current_price) / self.entry_price * 100
+            pnl_pct = (self.entry_price - current_price) / self.entry_price
+
+        pos_size_usd = self.margin_usdt * self.leverage
+        gross_profit = pos_size_usd * pnl_pct
+        total_fees = pos_size_usd * self.fee_pct * 2
+        net_profit = gross_profit - total_fees
+        return net_profit

@@ -128,7 +128,7 @@ class DashboardUI(QWidget):
         layout = QHBoxLayout(self)
         left_layout = QVBoxLayout()
 
-        self.portfolio_label = QLabel("BALANCE: $10000.00 | PNL: 0.00% | POS: NONE")
+        self.portfolio_label = QLabel("BALANCE: $10000.00 | NET PNL: $0.00 | POS: NONE")
         self.portfolio_label.setStyleSheet(
             "color:#00FFFF; font-size:18px; font-weight:bold; background:#001122; padding:5px;")
         left_layout.addWidget(self.portfolio_label)
@@ -199,7 +199,8 @@ class TopoAlphaEngine(QMainWindow):
         self.feeder = RobustDataFeeder(symbol, timeframe)
         self.tda = TDAAnalyzer()
         self.ml = TopoBooster()
-        self.trader = PaperTrader(initial_balance=10000.0, horizon=5)
+
+        self.trader = PaperTrader(initial_balance=10000.0, margin_usdt=50.0, leverage=10, horizon=5)
         self.api_executor = BinanceDemoExecutor(symbol=self.symbol, leverage=10, margin_usdt=50.0)
 
         self.timestamps = []
@@ -269,16 +270,17 @@ class TopoAlphaEngine(QMainWindow):
 
         res = self.trader.update(curr_p, self.absolute_candle_index)
         if res:
-            logger.info(f"TRADE CLOSED: {res}")
+            logger.info(
+                f"TRADE CLOSED ({res['reason']}): Net Profit: ${res['net_profit_usd']:.2f} | Bal: ${self.trader.balance:.2f}")
             self.api_executor.close_all_positions_and_orders()
             for l in [self.ui.horizon_line, self.ui.sl_line, self.ui.tp_line]:
                 l.hide()
 
-        pnl = self.trader.get_unrealized_pnl(curr_p)
-        color = "#00FF00" if pnl >= 0 else "#FF0000"
+        net_pnl = self.trader.get_unrealized_pnl(curr_p)
+        color = "#00FF00" if net_pnl >= 0 else "#FF0000"
 
         self.ui.portfolio_label.setText(
-            f"BALANCE: ${self.trader.balance:.2f} | PNL: <font color='{color}'>{pnl:.3f}%</font> | POS: {self.trader.position or 'NONE'}"
+            f"BALANCE: ${self.trader.balance:.2f} | NET PNL: <font color='{color}'>${net_pnl:.2f}</font> | POS: {self.trader.position or 'NONE'}"
         )
 
         if current_stress >= self.alpha_stress_threshold and not self.trader.position:
