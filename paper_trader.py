@@ -2,8 +2,8 @@ import sqlite3
 
 
 class PaperTrader:
-    def __init__(self, db_path='trading_state.db', initial_balance=10000.0, margin_usdt=50.0, leverage=10, horizon=5,
-                 sl_pct=0.002, tp_pct=0.004, fee_pct=0.0004):
+    def __init__(self, db_path='trading_state.db', initial_balance=10000.0, margin_usdt=50.0, leverage=10, horizon=10,
+                 sl_pct=0.004, tp_pct=0.008, fee_pct=0.0004):
         self.margin_usdt = margin_usdt
         self.leverage = leverage
         self.horizon_ms = horizon * 60 * 1000

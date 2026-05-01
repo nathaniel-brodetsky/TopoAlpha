@@ -6,6 +6,7 @@ from dotenv import load_dotenv
 load_dotenv()
 logger = logging.getLogger("TopoAlpha.Notifier")
 
+
 class TelegramNotifier:
     def __init__(self):
         self.token = os.getenv("TELEGRAM_BOT_TOKEN")
