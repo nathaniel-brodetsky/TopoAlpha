@@ -262,7 +262,7 @@ class DashboardUI(QWidget):
 
 
 class TopoAlphaEngine(QMainWindow):
-    def __init__(self, symbol='BTC/USDT', timeframe='1m', htf='15m'):
+    def __init__(self, symbol='BTC/USDT', timeframe='5m', htf='1h'):
         super().__init__()
         self.symbol = symbol
         self.timeframe = timeframe
@@ -278,9 +278,10 @@ class TopoAlphaEngine(QMainWindow):
             initial_balance=10000.0,
             margin_usdt=50.0,
             leverage=10,
-            horizon=10,
-            sl_pct=0.004,
-            tp_pct=0.008
+            horizon_bars=6,
+            timeframe_mins=5,
+            sl_pct=0.005,
+            tp_pct=0.010
         )
         self.api_executor = BinanceDemoExecutor(symbol=self.symbol, leverage=10, margin_usdt=50.0)
         self.notifier = TelegramNotifier()

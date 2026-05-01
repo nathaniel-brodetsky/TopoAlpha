@@ -2,11 +2,11 @@ import sqlite3
 
 
 class PaperTrader:
-    def __init__(self, db_path='trading_state.db', initial_balance=10000.0, margin_usdt=50.0, leverage=10, horizon=10,
-                 sl_pct=0.004, tp_pct=0.008, fee_pct=0.0004):
+    def __init__(self, db_path='trading_state.db', initial_balance=10000.0, margin_usdt=50.0, leverage=10,
+                 horizon_bars=6, timeframe_mins=5, sl_pct=0.005, tp_pct=0.010, fee_pct=0.0004):
         self.margin_usdt = margin_usdt
         self.leverage = leverage
-        self.horizon_ms = horizon * 60 * 1000
+        self.horizon_ms = horizon_bars * timeframe_mins * 60 * 1000
         self.sl_pct = sl_pct
         self.tp_pct = tp_pct
         self.fee_pct = fee_pct
@@ -81,7 +81,6 @@ class PaperTrader:
             gross_profit = pos_size_usd * pnl_pct
             total_fees = pos_size_usd * self.fee_pct * 2
             net_profit = gross_profit - total_fees
-
             self.balance += net_profit
 
             reason = "TIME"
