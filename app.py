@@ -5,7 +5,7 @@ import pyqtgraph as pg
 import matplotlib
 import matplotlib.pyplot as plt
 
-from PyQt5.QtWidgets import QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QLabel
+from PyQt5.QtWidgets import QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QLabel, QSlider
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 
@@ -134,6 +134,21 @@ class DashboardUI(QWidget):
             "color:#FFFF00; font-size:20px; font-weight:bold; background:#111; padding:5px;")
         left_layout.addWidget(self.signal_label)
 
+        control_layout = QHBoxLayout()
+        self.stress_label = QLabel(f"STRESS THRESHOLD: {self.stress_threshold:.1f}")
+        self.stress_label.setStyleSheet("color:#FF00FF; font-size:16px; font-weight:bold; padding:5px;")
+
+        self.stress_slider = QSlider(Qt.Horizontal)
+        self.stress_slider.setMinimum(0)
+        self.stress_slider.setMaximum(100)
+        self.stress_slider.setValue(int(self.stress_threshold * 10))
+        self.stress_slider.setTickPosition(QSlider.TicksBelow)
+        self.stress_slider.setTickInterval(10)
+
+        control_layout.addWidget(self.stress_label)
+        control_layout.addWidget(self.stress_slider)
+        left_layout.addLayout(control_layout)
+
         self.plot_price = pg.PlotWidget(title=f"Live Price ({self.symbol})", axisItems={'bottom': pg.DateAxisItem()})
         self.plot_price.showGrid(x=True, y=True)
         self.price_curve = self.plot_price.plot(pen=pg.mkPen('g', width=2))
@@ -212,6 +227,8 @@ class TopoAlphaEngine(QMainWindow):
         self.setWindowTitle(f"TopoAlpha Engine - {self.symbol}")
         self.resize(1600, 950)
 
+        self.ui.stress_slider.valueChanged.connect(self._on_threshold_changed)
+
         self._preload_data()
         self._restore_ui_state()
 
@@ -225,6 +242,11 @@ class TopoAlphaEngine(QMainWindow):
 
         self.notifier.send_message(
             f"🟢 <b>TopoAlpha Engine Started</b>\nSymbol: {self.symbol}\nBalance: ${self.trader.balance:.2f}")
+
+    def _on_threshold_changed(self, value):
+        self.alpha_stress_threshold = value / 10.0
+        self.ui.stress_label.setText(f"STRESS THRESHOLD: {self.alpha_stress_threshold:.1f}")
+        self.ui.stress_threshold_line.setPos(self.alpha_stress_threshold)
 
     def _preload_data(self):
         ohlcv = self.feeder.fetch_initial(limit=500)

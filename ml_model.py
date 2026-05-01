@@ -19,7 +19,7 @@ class TopoBooster:
         )
         self.is_trained = False
         self.lookback = 10
-        self.threshold = 0.0005  # Порог движения (0.05%)
+        self.threshold = 0.0005
 
     def prepare_features(self, prices, stress_history, obi_history):
         df = pd.DataFrame({
@@ -39,7 +39,6 @@ class TopoBooster:
 
         df[f'future_return_{horizon}'] = df['close'].shift(-horizon) / df['close'] - 1
 
-        # 1: Long, 2: Short, 0: Flat
         conditions = [
             df[f'future_return_{horizon}'] >= self.threshold,
             df[f'future_return_{horizon}'] <= -self.threshold
@@ -68,11 +67,11 @@ class TopoBooster:
 
     def predict(self, current_prices, current_stress, current_obi):
         if not self.is_trained:
-            return 0.5
+            return {'flat': 1.0, 'up': 0.0, 'down': 0.0}
 
         df = self.prepare_features(current_prices, current_stress, current_obi)
         if len(df) == 0:
-            return 0.5
+            return {'flat': 1.0, 'up': 0.0, 'down': 0.0}
 
         last_X = df.drop(['close', 'target', f'future_return_5'], axis=1, errors='ignore').iloc[-1:]
 
@@ -83,9 +82,4 @@ class TopoBooster:
         p_long = probas[classes.index(1)] if 1 in classes else 0.0
         p_short = probas[classes.index(2)] if 2 in classes else 0.0
 
-        if p_long > p_short and p_long > p_flat:
-            return float(p_long)
-        elif p_short > p_long and p_short > p_flat:
-            return float(1.0 - p_short)
-        else:
-            return 0.5
+        return {'flat': float(p_flat), 'up': float(p_long), 'down': float(p_short)}
