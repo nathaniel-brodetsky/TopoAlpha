@@ -21,17 +21,21 @@ class BinanceDemoExecutor:
             logger.error("[BINANCE API] Keys missing in .env file!")
             return
 
-        self.client = Client(api_key, api_secret)
+        # Увеличиваем таймаут запросов до 20 секунд для лагучего Testnet
+        self.client = Client(api_key, api_secret, requests_params={'timeout': 20})
         self.client.FUTURES_URL = 'https://testnet.binancefuture.com/fapi'
 
         try:
-            self.client.futures_change_leverage(symbol=self.symbol, leverage=self.leverage)
+            self.client.futures_change_leverage(symbol=self.symbol, leverage=self.leverage, recvWindow=60000)
             logger.info(f"[BINANCE API] Connected to Testnet. Leverage: {self.leverage}x")
         except Exception as e:
             logger.error(f"[BINANCE API] Init Error: {e}")
 
     def execute_trade(self, side, current_price, sl_pct=0.002, tp_pct=0.004):
         try:
+            # ЖЕСТКАЯ ОЧИСТКА: Удаляем все старые висящие стопы перед новой сделкой
+            self.client.futures_cancel_all_open_orders(symbol=self.symbol, recvWindow=60000)
+
             order_side = 'BUY' if side == 'LONG' else 'SELL'
             close_side = 'SELL' if side == 'LONG' else 'BUY'
 
@@ -47,7 +51,8 @@ class BinanceDemoExecutor:
                 symbol=self.symbol,
                 side=order_side,
                 type='MARKET',
-                quantity=amount_coins
+                quantity=amount_coins,
+                recvWindow=60000
             )
             logger.info(f"[BINANCE API] MARKET {order_side} FILLED: {amount_coins} {self.symbol}")
 
@@ -59,7 +64,8 @@ class BinanceDemoExecutor:
                 side=close_side,
                 type='STOP_MARKET',
                 stopPrice=sl_price,
-                closePosition=True
+                closePosition=True,
+                recvWindow=60000
             )
 
             self.client.futures_create_order(
@@ -67,7 +73,8 @@ class BinanceDemoExecutor:
                 side=close_side,
                 type='TAKE_PROFIT_MARKET',
                 stopPrice=tp_price,
-                closePosition=True
+                closePosition=True,
+                recvWindow=60000
             )
             logger.info(f"[BINANCE API] SL: {sl_price} | TP: {tp_price}")
             return True
@@ -78,9 +85,9 @@ class BinanceDemoExecutor:
 
     def close_all_positions_and_orders(self):
         try:
-            self.client.futures_cancel_all_open_orders(symbol=self.symbol)
+            self.client.futures_cancel_all_open_orders(symbol=self.symbol, recvWindow=60000)
 
-            positions = self.client.futures_position_information(symbol=self.symbol)
+            positions = self.client.futures_position_information(symbol=self.symbol, recvWindow=60000)
             for pos in positions:
                 amt = float(pos['positionAmt'])
                 if amt != 0:
@@ -89,7 +96,8 @@ class BinanceDemoExecutor:
                         symbol=self.symbol,
                         side=side,
                         type='MARKET',
-                        quantity=abs(amt)
+                        quantity=abs(amt),
+                        recvWindow=60000
                     )
                     logger.info(f"[BINANCE API] Position closed via MARKET {side}: {abs(amt)} {self.symbol}")
         except Exception as e:

@@ -5,9 +5,12 @@ import warnings
 
 warnings.filterwarnings('ignore')
 
+
 class TopoBooster:
     def __init__(self):
         self.model = lgb.LGBMClassifier(
+            objective='multiclass',
+            num_class=3,
             n_estimators=100,
             learning_rate=0.05,
             max_depth=4,
@@ -16,6 +19,7 @@ class TopoBooster:
         )
         self.is_trained = False
         self.lookback = 10
+        self.threshold = 0.0005  # Порог движения (0.05%)
 
     def prepare_features(self, prices, stress_history, obi_history):
         df = pd.DataFrame({
@@ -34,7 +38,14 @@ class TopoBooster:
         horizon = 5
 
         df[f'future_return_{horizon}'] = df['close'].shift(-horizon) / df['close'] - 1
-        df['target'] = (df[f'future_return_{horizon}'] > 0.0005).astype(int)
+
+        # 1: Long, 2: Short, 0: Flat
+        conditions = [
+            df[f'future_return_{horizon}'] >= self.threshold,
+            df[f'future_return_{horizon}'] <= -self.threshold
+        ]
+        choices = [1, 2]
+        df['target'] = np.select(conditions, choices, default=0)
 
         df.dropna(inplace=True)
         return df
@@ -44,6 +55,9 @@ class TopoBooster:
             return False
 
         df = self.prepare_features(prices, stress_history, obi_history)
+
+        if df['target'].nunique() < 2:
+            return False
 
         X = df.drop(['close', 'target', f'future_return_5'], axis=1, errors='ignore')
         y = df['target']
@@ -61,5 +75,17 @@ class TopoBooster:
             return 0.5
 
         last_X = df.drop(['close', 'target', f'future_return_5'], axis=1, errors='ignore').iloc[-1:]
-        prob_up = self.model.predict_proba(last_X)[0][1]
-        return prob_up
+
+        probas = self.model.predict_proba(last_X)[0]
+        classes = list(self.model.classes_)
+
+        p_flat = probas[classes.index(0)] if 0 in classes else 0.0
+        p_long = probas[classes.index(1)] if 1 in classes else 0.0
+        p_short = probas[classes.index(2)] if 2 in classes else 0.0
+
+        if p_long > p_short and p_long > p_flat:
+            return float(p_long)
+        elif p_short > p_long and p_short > p_flat:
+            return float(1.0 - p_short)
+        else:
+            return 0.5
