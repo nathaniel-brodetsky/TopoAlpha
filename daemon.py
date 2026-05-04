@@ -21,8 +21,12 @@ TIMEFRAME = "5m"
 HTF = "1h"
 TIMEFRAME_MINS = 5
 HORIZON_BARS = 6
-RETRAIN_EVERY = 150
+RETRAIN_EVERY = 300
 POLL_INTERVAL_S = 2
+
+ENTRY_PROB_THRESHOLD = 0.65
+
+HTF_MIN_CANDLES = 21
 
 
 class TopoAlphaDaemon:
@@ -73,6 +77,30 @@ class TopoAlphaDaemon:
         self.tick_counter: int = 0
         self._retrain_lock = threading.Lock()
 
+    # ── HTF trend filter ────────────────────────────────────────────────── #
+
+    def _htf_trend(self) -> str:
+        """Return 'bull', 'bear' or 'flat' based on EMA8 vs EMA21 on HTF closes.
+
+        Uses simple arithmetic means over the last N closes as a lightweight
+        proxy for EMA — accurate enough given we only need direction.
+        Falls back to 'flat' (= no trade) when data is insufficient.
+        """
+        if len(self.prices_htf) < HTF_MIN_CANDLES:
+            return "flat"
+
+        ema8 = float(np.mean(self.prices_htf[-8:]))
+        ema21 = float(np.mean(self.prices_htf[-21:]))
+
+        gap_pct = (ema8 - ema21) / (ema21 + 1e-10)
+        if gap_pct > 0.001:
+            return "bull"
+        elif gap_pct < -0.001:
+            return "bear"
+        return "flat"
+
+    # ── Lifecycle ───────────────────────────────────────────────────────── #
+
     def preload_data(self) -> bool:
         logger.info("Preloading historical data…")
 
@@ -107,9 +135,11 @@ class TopoAlphaDaemon:
         if self.trader.position:
             logger.info(f"Restored active {self.trader.position} position from database.")
 
+        htf_trend = self._htf_trend()
         self.notifier.send_message(
             f"🤖 <b>TopoAlpha Started</b>\n"
             f"Symbol: {self.symbol}\n"
+            f"HTF trend: {htf_trend}\n"
             f"Balance: ${self.trader.balance:.2f}"
         )
         return True
@@ -174,6 +204,8 @@ class TopoAlphaDaemon:
             else:
                 time.sleep(POLL_INTERVAL_S)
 
+    # ── Core tick ───────────────────────────────────────────────────────── #
+
     def _tick(self) -> None:
         obi = self.feeder.fetch_order_book_imbalance(depth=20)
 
@@ -229,10 +261,18 @@ class TopoAlphaDaemon:
                 )
 
             if current_stress >= self.alpha_stress_threshold and not self.trader.position:
-                if probs["up"] >= 0.60:
-                    self._open_trade("LONG", curr_p, curr_ms, current_stress, probs["up"])
-                elif probs["down"] >= 0.60:
-                    self._open_trade("SHORT", curr_p, curr_ms, current_stress, probs["down"])
+                htf_trend = self._htf_trend()
+
+                if probs["up"] >= ENTRY_PROB_THRESHOLD and htf_trend == "bull":
+                    self._open_trade("LONG", curr_p, curr_ms, current_stress, probs["up"], htf_trend)
+                elif probs["down"] >= ENTRY_PROB_THRESHOLD and htf_trend == "bear":
+                    self._open_trade("SHORT", curr_p, curr_ms, current_stress, probs["down"], htf_trend)
+                else:
+                    dominant = "up" if probs["up"] > probs["down"] else "down"
+                    logger.debug(
+                        f"Signal suppressed — HTF: {htf_trend}  "
+                        f"P(up): {probs['up']:.2f}  P(down): {probs['down']:.2f}"
+                    )
 
         self._trim()
 
@@ -240,18 +280,30 @@ class TopoAlphaDaemon:
         if self.tick_counter % RETRAIN_EVERY == 0 and len(self.prices) > 100:
             self._schedule_retrain()
 
-    def _open_trade(self, side: str, price: float, timestamp: int, stress: float, prob: float) -> None:
+    def _open_trade(
+            self,
+            side: str,
+            price: float,
+            timestamp: int,
+            stress: float,
+            prob: float,
+            htf_trend: str,
+    ) -> None:
         if not self.trader.execute_trade(side, price, timestamp):
             return
 
         icon = "🚀" if side == "LONG" else "🩸"
         prob_label = "UP" if side == "LONG" else "DOWN"
-        logger.info(f"OPEN {side} @ {price}  Stress: {stress:.2f}  P({prob_label}): {prob:.2f}")
+        logger.info(
+            f"OPEN {side} @ {price}  Stress: {stress:.2f}  "
+            f"P({prob_label}): {prob:.2f}  HTF: {htf_trend}"
+        )
         self.notifier.send_message(
             f"{icon} <b>OPEN {side}</b>\n"
             f"Price: {price}\n"
             f"Stress: {stress:.2f}\n"
-            f"P({prob_label}): {prob:.1%}"
+            f"P({prob_label}): {prob:.1%}\n"
+            f"HTF trend: {htf_trend}"
         )
 
 
