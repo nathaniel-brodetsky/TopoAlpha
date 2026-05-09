@@ -12,7 +12,8 @@ from PyQt5.QtWidgets import (
     QHBoxLayout, QVBoxLayout, QLabel, QSlider,
     QProgressDialog, QPushButton,
 )
-from PyQt5.QtCore import Qt, QThread, pyqtSignal
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QRectF
+from PyQt5.QtGui import QPicture, QPainter, QPen, QBrush, QColor
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 
 matplotlib.use("Qt5Agg")
@@ -20,7 +21,7 @@ plt.style.use("dark_background")
 
 from data_feeder import RobustDataFeeder
 from tda_core import TDAAnalyzer
-from ml_model import TopoBooster
+from ml_model import TopoBooster, detect_phase_transition
 from paper_trader import PaperTrader
 from notifier import TelegramNotifier
 
@@ -32,32 +33,95 @@ logging.basicConfig(
 logger = logging.getLogger("TopoAlpha")
 
 _3D_REDRAW_EVERY = 5
+TDA_EMBED_WINDOW = 50
+
+
+class CandlestickItem(pg.GraphicsObject):
+    _BULL_COLOR = QColor(0, 210, 80, 160)
+    _BEAR_COLOR = QColor(220, 50, 50, 160)
+    _WICK_COLOR = QColor(180, 180, 180, 200)
+
+    def __init__(self):
+        super().__init__()
+        self._candles: list = []
+        self._picture: QPicture | None = None
+
+    def setData(self, candles: list) -> None:
+        self._candles = candles
+        self._picture = None
+        self.prepareGeometryChange()
+        self.update()
+
+    def _build_picture(self) -> None:
+        self._picture = QPicture()
+        p = QPainter(self._picture)
+        p.setRenderHint(QPainter.Antialiasing, False)
+
+        data = self._candles
+        if len(data) < 2:
+            p.end()
+            return
+
+        bar_w = (data[-1][0] - data[0][0]) / max(len(data) - 1, 1) * 0.38
+
+        for c in data:
+            t, o, h, l, cl = c[0], c[1], c[2], c[3], c[4]
+            bull = cl >= o
+            body_col = self._BULL_COLOR if bull else self._BEAR_COLOR
+
+            p.setPen(QPen(self._WICK_COLOR, 1))
+            p.drawLine(
+                pg.QtCore.QPointF(t, l),
+                pg.QtCore.QPointF(t, h),
+            )
+
+            body_top = max(o, cl)
+            body_bot = min(o, cl)
+            body_h = max(body_top - body_bot, 1e-8)
+            p.setPen(QPen(body_col.darker(130), 1))
+            p.setBrush(QBrush(body_col))
+            p.drawRect(QRectF(t - bar_w, body_bot, bar_w * 2, body_h))
+
+        p.end()
+
+    def paint(self, p, *args) -> None:
+        if not self._candles:
+            return
+        if self._picture is None:
+            self._build_picture()
+        self._picture.play(p)
+
+    def boundingRect(self) -> QRectF:
+        if not self._candles:
+            return QRectF()
+        ts = [c[0] for c in self._candles]
+        ls = [c[3] for c in self._candles]
+        hs = [c[2] for c in self._candles]
+        w = (max(ts) - min(ts)) or 1
+        h = (max(hs) - min(ls)) or 1
+        return QRectF(min(ts), min(ls), w, h)
 
 
 class PreloadWorker(QThread):
-    """Runs historical fetch + TDA backfill + initial ML train off the main thread."""
-
     progress = pyqtSignal(int, str)
     finished = pyqtSignal(bool)
 
     def __init__(self, feeder, tda, ml, tau, dim,
-                 prices, timestamps, stress_history, obi_history,
-                 prices_htf, timestamps_htf):
+                 candles, stress_history, obi_history,
+                 candles_htf):
         super().__init__()
         self.feeder = feeder
         self.tda = tda
         self.ml = ml
         self.tau = tau
         self.dim = dim
-        self.prices = prices
-        self.timestamps = timestamps
+        self.candles = candles
         self.stress_history = stress_history
         self.obi_history = obi_history
-        self.prices_htf = prices_htf
-        self.timestamps_htf = timestamps_htf
+        self.candles_htf = candles_htf
 
-    def _build_embedding(self, price_window, tau, dim) -> np.ndarray:
-        data = np.array(price_window, dtype=float)
+    def _build_embedding(self, prices, tau, dim) -> np.ndarray:
+        data = np.array(prices, dtype=float)
         if len(data) < (dim - 1) * tau + 1:
             return np.zeros((1, 3))
         data = (data - np.mean(data)) / (np.std(data) + 1e-8) * 10
@@ -66,36 +130,36 @@ class PreloadWorker(QThread):
     def run(self) -> None:
         try:
             self.progress.emit(5, "Fetching LTF candles…")
-            ohlcv = self.feeder.fetch_initial(limit=500)
+            ohlcv = self.feeder.fetch_initial(limit=600)
             if not ohlcv:
                 self.finished.emit(False)
                 return
 
             for c in ohlcv:
-                self.timestamps.append(c[0])
-                self.prices.append(c[4])
+                self.candles.append(c)
                 self.stress_history.append(0.0)
                 self.obi_history.append(0.0)
 
             self.progress.emit(20, "Fetching HTF candles…")
-            for c in self.feeder.fetch_initial_htf(limit=150):
-                self.timestamps_htf.append(c[0])
-                self.prices_htf.append(c[4])
+            for c in self.feeder.fetch_initial_htf(limit=200):
+                self.candles_htf.append(c)
 
             self.progress.emit(30, "Back-filling topological stress…")
-            n = len(self.prices)
-            for i in range(50, n):
-                embedded = self._build_embedding(self.prices[i - 50:i], self.tau, self.dim)
+            prices = [c[4] for c in self.candles]
+            n = len(prices)
+            for i in range(TDA_EMBED_WINDOW, n):
+                embedded = self._build_embedding(prices[i - TDA_EMBED_WINDOW:i], self.tau, self.dim)
                 if len(embedded) > 0:
                     self.stress_history[i] = self.tda.get_topological_stress(embedded)
-                if (i - 50) % 50 == 0:
-                    pct = 30 + int(50 * (i - 50) / max(n - 50, 1))
+                if (i - TDA_EMBED_WINDOW) % 50 == 0:
+                    pct = 30 + int(50 * (i - TDA_EMBED_WINDOW) / max(n - TDA_EMBED_WINDOW, 1))
                     self.progress.emit(pct, f"TDA backfill {i}/{n}…")
 
             self.progress.emit(85, "Training initial ML model…")
-            self.ml.train(self.prices, self.stress_history, self.obi_history,
-                          prices_htf=self.prices_htf)
-
+            self.ml.train(
+                self.candles, self.stress_history, self.obi_history,
+                candles_htf=self.candles_htf,
+            )
             self.progress.emit(100, "Ready.")
             self.finished.emit(True)
         except Exception as exc:
@@ -105,29 +169,31 @@ class PreloadWorker(QThread):
 
 class MarketStreamer(QThread):
     data_ready = pyqtSignal(list, list, list, list, dict, np.ndarray, float)
-    error_occurred = pyqtSignal(str)
+    new_candle = pyqtSignal(list)
 
     def __init__(self, feeder, tda, ml, tau, dim,
-                 prices, timestamps, stress_history, obi_history,
-                 prices_htf, timestamps_htf):
+                 candles, stress_history, obi_history, candles_htf):
         super().__init__()
         self.feeder = feeder
         self.tda = tda
         self.ml = ml
         self.tau = tau
         self.dim = dim
-        self.prices = prices
-        self.timestamps = timestamps
+        self.candles = candles
         self.stress_history = stress_history
         self.obi_history = obi_history
-        self.prices_htf = prices_htf
-        self.timestamps_htf = timestamps_htf
+        self.candles_htf = candles_htf
         self.running = True
         self.tick_counter = 0
         self._retrain_lock = threading.Lock()
+        self._last_phase_retrain = -999
+
+    def _get_prices(self) -> list:
+        return [c[4] for c in self.candles]
 
     def _get_embedding(self) -> np.ndarray:
-        data = np.array(self.prices, dtype=float)
+        prices = self._get_prices()
+        data = np.array(prices, dtype=float)
         if len(data) < (self.dim - 1) * self.tau + 1:
             return np.zeros((1, 3))
         data = (data - np.mean(data)) / (np.std(data) + 1e-8) * 10
@@ -137,26 +203,23 @@ class MarketStreamer(QThread):
             data[2 * self.tau:],
         ]).T
 
-    def _schedule_retrain(self) -> None:
-        prices_snap = list(self.prices)
+    def _schedule_retrain(self, reason: str = "") -> None:
+        candles_snap = list(self.candles)
         stress_snap = list(self.stress_history)
         obi_snap = list(self.obi_history)
-        htf_snap = list(self.prices_htf)
-
+        htf_snap = list(self.candles_htf)
         threading.Thread(
             target=self._retrain_background,
-            args=(prices_snap, stress_snap, obi_snap, htf_snap),
-            daemon=True,
-            name="ml-retrain",
+            args=(candles_snap, stress_snap, obi_snap, htf_snap, reason),
+            daemon=True, name="ml-retrain",
         ).start()
 
-    def _retrain_background(self, prices, stress, obi, prices_htf) -> None:
+    def _retrain_background(self, candles, stress, obi, candles_htf, reason="") -> None:
         if not self._retrain_lock.acquire(blocking=False):
-            logger.info("Retrain already in progress — skipping.")
             return
         try:
-            logger.info("Retraining ML in background…")
-            self.ml.train(prices, stress, obi, prices_htf=prices_htf)
+            logger.info(f"Retraining ML… ({reason})")
+            self.ml.train(candles, stress, obi, candles_htf=candles_htf)
             logger.info("Retrain complete.")
         except Exception as exc:
             logger.error(f"Retrain failed: {exc}")
@@ -170,61 +233,68 @@ class MarketStreamer(QThread):
 
                 ohlcv_htf = self.feeder.fetch_updates_htf()
                 if ohlcv_htf:
-                    for t, _, _, _, c, _ in ohlcv_htf:
-                        if not self.timestamps_htf or t > self.timestamps_htf[-1]:
-                            self.timestamps_htf.append(t)
-                            self.prices_htf.append(c)
-                        elif t == self.timestamps_htf[-1]:
-                            self.prices_htf[-1] = c
-                    if len(self.prices_htf) > 200:
-                        del self.timestamps_htf[:-200]
-                        del self.prices_htf[:-200]
+                    for c in ohlcv_htf:
+                        t = c[0]
+                        if not self.candles_htf or t > self.candles_htf[-1][0]:
+                            self.candles_htf.append(c)
+                        elif t == self.candles_htf[-1][0]:
+                            self.candles_htf[-1] = c
+                    if len(self.candles_htf) > 250:
+                        del self.candles_htf[:-250]
 
                 ohlcv = self.feeder.fetch_updates()
                 if ohlcv:
-                    for t, _o, _h, _l, c, _v in ohlcv:
-                        if not self.timestamps or t > self.timestamps[-1]:
-                            self.timestamps.append(t)
-                            self.prices.append(c)
+                    for c in ohlcv:
+                        t = c[0]
+                        if not self.candles or t > self.candles[-1][0]:
+                            self.new_candle.emit(list(c))
+                            self.candles.append(list(c))
                             self.stress_history.append(0.0)
                             self.obi_history.append(obi)
-                        elif t == self.timestamps[-1]:
-                            self.prices[-1] = c
+                        elif t == self.candles[-1][0]:
+                            self.candles[-1] = list(c)
                             self.obi_history[-1] = obi
 
-                    if len(self.prices) > 500:
-                        del self.timestamps[:-500]
-                        del self.prices[:-500]
-                        del self.stress_history[:-500]
-                        del self.obi_history[:-500]
+                    if len(self.candles) > 600:
+                        del self.candles[:-600]
+                        del self.stress_history[:-600]
+                        del self.obi_history[:-600]
 
                     embedded = self._get_embedding()
                     current_stress = 0.0
                     probs = {"flat": 1.0, "up": 0.0, "down": 0.0}
 
                     if len(embedded) > 0:
-                        current_stress = self.tda.get_topological_stress(embedded[-50:])
+                        current_stress = self.tda.get_topological_stress(embedded[-TDA_EMBED_WINDOW:])
                         self.stress_history[-1] = current_stress
                         if self.ml.is_trained:
                             probs = self.ml.predict(
-                                self.prices, self.stress_history, self.obi_history,
-                                prices_htf=self.prices_htf,
+                                self.candles, self.stress_history, self.obi_history,
+                                candles_htf=self.candles_htf,
                             )
 
+                    timestamps = [c[0] for c in self.candles]
+                    prices = [c[4] for c in self.candles]
                     self.data_ready.emit(
-                        list(self.timestamps), list(self.prices),
+                        timestamps, prices,
                         list(self.stress_history), list(self.obi_history),
                         probs, embedded, current_stress,
                     )
 
+                if (self.tick_counter - self._last_phase_retrain > 80
+                        and detect_phase_transition(self.candles)):
+                    self._last_phase_retrain = self.tick_counter
+                    logger.info("⚡ Phase transition → retrain")
+                    self._schedule_retrain("phase-transition")
+
                 self.tick_counter += 1
-                if self.tick_counter % 150 == 0 and len(self.prices) > 100:
-                    self._schedule_retrain()
+                if self.tick_counter % 200 == 0 and len(self.candles) > 100:
+                    self._schedule_retrain("scheduled")
 
             except Exception as exc:
-                self.error_occurred.emit(str(exc))
+                logger.error(f"STREAMER: {exc}")
 
-            self.msleep(2_000)
+            self.msleep(1_000)
 
     def stop(self) -> None:
         self.running = False
@@ -283,22 +353,32 @@ class DashboardUI(QWidget):
         left_layout.addLayout(ctrl)
 
         self.plot_price = pg.PlotWidget(
-            title=f"Live Price ({self.symbol})",
+            title=f"Live Price — Candlesticks ({self.symbol})",
             axisItems={"bottom": pg.DateAxisItem()},
         )
         self.plot_price.showGrid(x=True, y=True)
-        self.price_curve = self.plot_price.plot(pen=pg.mkPen("g", width=2))
+        self.plot_price.setBackground("#080810")
+
+        self.candle_item = CandlestickItem()
+        self.plot_price.addItem(self.candle_item)
+
         self.buy_scatter = pg.ScatterPlotItem(size=14, brush=pg.mkBrush(0, 255, 0), symbol="t1")
-        self.sell_scatter = pg.ScatterPlotItem(size=14, brush=pg.mkBrush(255, 0, 0), symbol="t")
+        self.sell_scatter = pg.ScatterPlotItem(size=14, brush=pg.mkBrush(255, 50, 50), symbol="t")
         self.plot_price.addItem(self.buy_scatter)
         self.plot_price.addItem(self.sell_scatter)
 
         self.horizon_line = pg.InfiniteLine(angle=90, pen=pg.mkPen("y", style=Qt.DashLine))
-        self.sl_line = pg.InfiniteLine(angle=0, pen=pg.mkPen("r", style=Qt.DashLine))
-        self.tp_line = pg.InfiniteLine(angle=0, pen=pg.mkPen("g", style=Qt.DashLine))
+        self.sl_line = pg.InfiniteLine(angle=0, pen=pg.mkPen(pg.mkColor(255, 80, 80), width=2, style=Qt.DashLine))
+        self.tp_line = pg.InfiniteLine(angle=0, pen=pg.mkPen(pg.mkColor(80, 255, 80), width=2, style=Qt.DashLine))
         for line in [self.horizon_line, self.sl_line, self.tp_line]:
             line.hide()
             self.plot_price.addItem(line)
+
+        self.pending_label = QLabel("")
+        self.pending_label.setStyleSheet(
+            "color:#FF8800; font-size:15px; font-weight:bold; padding:2px;"
+        )
+        left_layout.addWidget(self.pending_label)
         left_layout.addWidget(self.plot_price, stretch=3)
 
         self.plot_stress = pg.PlotWidget(
@@ -306,7 +386,10 @@ class DashboardUI(QWidget):
             axisItems={"bottom": pg.DateAxisItem()},
         )
         self.plot_stress.showGrid(x=True, y=True)
-        self.stress_curve = self.plot_stress.plot(pen=pg.mkPen("r", width=2), fillLevel=0, brush=(255, 0, 0, 50))
+        self.plot_stress.setBackground("#080810")
+        self.stress_curve = self.plot_stress.plot(
+            pen=pg.mkPen("r", width=2), fillLevel=0, brush=(255, 0, 0, 50)
+        )
         self.plot_stress.setXLink(self.plot_price)
         self.stress_threshold_line = pg.InfiniteLine(
             pos=self.stress_threshold, angle=0,
@@ -320,9 +403,14 @@ class DashboardUI(QWidget):
             axisItems={"bottom": pg.DateAxisItem()},
         )
         self.plot_obi.showGrid(x=True, y=True)
-        self.obi_curve = self.plot_obi.plot(pen=pg.mkPen("c", width=2), fillLevel=0, brush=(0, 255, 255, 50))
+        self.plot_obi.setBackground("#080810")
+        self.obi_curve = self.plot_obi.plot(
+            pen=pg.mkPen("c", width=2), fillLevel=0, brush=(0, 255, 255, 50)
+        )
         self.plot_obi.setXLink(self.plot_price)
-        self.plot_obi.addItem(pg.InfiniteLine(pos=0.0, angle=0, pen=pg.mkPen("w", width=1, style=Qt.DashLine)))
+        self.plot_obi.addItem(
+            pg.InfiniteLine(pos=0.0, angle=0, pen=pg.mkPen("w", width=1, style=Qt.DashLine))
+        )
         left_layout.addWidget(self.plot_obi, stretch=1)
 
         left_widget = QWidget()
@@ -337,7 +425,12 @@ class DashboardUI(QWidget):
 
 
 class TopoAlphaEngine(QMainWindow):
-    def __init__(self, symbol: str = "BTC/USDT", timeframe: str = "5m", htf: str = "1h"):
+    def __init__(
+            self,
+            symbol: str = "BTC/USDT",
+            timeframe: str = "1m",
+            htf: str = "15m",
+    ):
         super().__init__()
         self.symbol = symbol
         self.timeframe = timeframe
@@ -345,6 +438,7 @@ class TopoAlphaEngine(QMainWindow):
         self.tau = 5
         self.dim = 3
         self.alpha_stress_threshold = 1.5
+        self._ENTRY_PROB_THRESHOLD = 0.62
 
         self.feeder = RobustDataFeeder(symbol, timeframe, htf=htf)
         self.tda = TDAAnalyzer()
@@ -353,29 +447,27 @@ class TopoAlphaEngine(QMainWindow):
             initial_balance=10_000.0,
             margin_usdt=50.0,
             leverage=10,
-            horizon_bars=6,
-            timeframe_mins=5,
-            sl_pct=0.005,
-            tp_pct=0.010,
+            horizon_bars=12,
+            timeframe_mins=1,
+            sl_atr_mult=1.5,
+            tp_atr_mult=3.0,
         )
         self.notifier = TelegramNotifier()
 
-        self.timestamps: list = []
-        self.prices: list = []
+        self.candles: list = []
+        self.candles_htf: list = []
         self.stress_history: list = []
         self.obi_history: list = []
-        self.timestamps_htf: list = []
-        self.prices_htf: list = []
-        self.last_processed_time: int = 0
-        self._scatter_tick: int = 0
 
+        self._last_ts: int = 0
+        self._scatter_tick: int = 0
         self.worker: MarketStreamer | None = None
         self._calc_window = None
 
         self.ui = DashboardUI(self.symbol, self.alpha_stress_threshold)
         self.setCentralWidget(self.ui)
-        self.setWindowTitle(f"TopoAlpha — {self.symbol}  [{htf} macro]")
-        self.resize(1600, 950)
+        self.setWindowTitle(f"TopoAlpha v2 — {self.symbol}  [{htf} macro]  LTF:{timeframe}")
+        self.resize(1680, 980)
         self.ui.stress_slider.valueChanged.connect(self._on_threshold_changed)
         self.ui.calc_btn.clicked.connect(self._open_calculator)
 
@@ -391,8 +483,8 @@ class TopoAlphaEngine(QMainWindow):
 
         self._preloader = PreloadWorker(
             self.feeder, self.tda, self.ml, self.tau, self.dim,
-            self.prices, self.timestamps, self.stress_history, self.obi_history,
-            self.prices_htf, self.timestamps_htf,
+            self.candles, self.stress_history, self.obi_history,
+            self.candles_htf,
         )
         self._preloader.progress.connect(self._on_preload_progress)
         self._preloader.finished.connect(self._on_preload_finished)
@@ -413,55 +505,77 @@ class TopoAlphaEngine(QMainWindow):
     def _restore_ui_state(self) -> None:
         if not self.trader.position:
             return
-        curr_p = self.trader.entry_price
-        curr_t = self.trader.entry_time / 1_000.0
+        p = self.trader.entry_price
+        t = self.trader.entry_time / 1_000.0
         if self.trader.position == "LONG":
-            self.ui.buy_markers_x.append(curr_t)
-            self.ui.buy_markers_y.append(curr_p)
-            self.ui.tp_line.setPos(curr_p * (1 + self.trader.tp_pct))
-            self.ui.sl_line.setPos(curr_p * (1 - self.trader.sl_pct))
+            self.ui.buy_markers_x.append(t)
+            self.ui.buy_markers_y.append(p)
+            self.ui.tp_line.setPos(self.trader.current_tp_price or p * 1.01)
+            self.ui.sl_line.setPos(self.trader.current_sl_price or p * 0.99)
         else:
-            self.ui.sell_markers_x.append(curr_t)
-            self.ui.sell_markers_y.append(curr_p)
-            self.ui.tp_line.setPos(curr_p * (1 - self.trader.tp_pct))
-            self.ui.sl_line.setPos(curr_p * (1 + self.trader.sl_pct))
-        self.ui.horizon_line.setPos(curr_t + self.trader.horizon_ms / 1_000.0)
+            self.ui.sell_markers_x.append(t)
+            self.ui.sell_markers_y.append(p)
+            self.ui.tp_line.setPos(self.trader.current_tp_price or p * 0.99)
+            self.ui.sl_line.setPos(self.trader.current_sl_price or p * 1.01)
+        horizon_s = (self.trader.entry_time + self.trader.horizon_ms) / 1_000.0
+        self.ui.horizon_line.setPos(horizon_s)
         for line in [self.ui.horizon_line, self.ui.tp_line, self.ui.sl_line]:
             line.show()
-        self.ui.buy_scatter.setData(self.ui.buy_markers_x, self.ui.buy_markers_y)
-        self.ui.sell_scatter.setData(self.ui.sell_markers_x, self.ui.sell_markers_y)
 
     def _start_worker(self) -> None:
         self.worker = MarketStreamer(
             self.feeder, self.tda, self.ml, self.tau, self.dim,
-            self.prices, self.timestamps, self.stress_history, self.obi_history,
-            self.prices_htf, self.timestamps_htf,
+            self.candles, self.stress_history, self.obi_history,
+            self.candles_htf,
         )
         self.worker.data_ready.connect(self._update_interface)
-        self.worker.error_occurred.connect(lambda msg: logger.error(f"STREAMER: {msg}"))
+        self.worker.new_candle.connect(self._on_new_candle)
         self.worker.start()
 
         self.notifier.send_message(
-            f"🟢 <b>TopoAlpha Started</b>\n"
-            f"Symbol: {self.symbol}  |  HTF: {self.htf}\n"
+            f"🟢 <b>TopoAlpha v2 Started</b>\n"
+            f"Symbol: {self.symbol}  TF: {self.timeframe}  HTF: {self.htf}\n"
             f"Balance: ${self.trader.balance:.2f}"
         )
 
-    def _open_calculator(self) -> None:
-        from trade_calculator import TradeCalculatorWindow
-        if self._calc_window is None:
-            self._calc_window = TradeCalculatorWindow(parent=None)
-        self._calc_window.feed(
-            self.prices, self.stress_history, self.obi_history,
-            self.prices_htf, self.ml, self.trader,
-        )
-        self._calc_window.show()
-        self._calc_window.raise_()
+    def _on_new_candle(self, candle: list) -> None:
+        open_price = candle[1]
+        curr_ms = candle[0]
+        executed = self.trader.execute_at_open(open_price, curr_ms)
 
-    def _on_threshold_changed(self, value: int) -> None:
-        self.alpha_stress_threshold = value / 10.0
-        self.ui.stress_label.setText(f"STRESS THRESHOLD: {self.alpha_stress_threshold:.1f}")
-        self.ui.stress_threshold_line.setPos(self.alpha_stress_threshold)
+        if executed:
+            side = self.trader.position
+            curr_t = curr_ms / 1_000.0
+            if side == "LONG":
+                self.ui.buy_markers_x.append(curr_t)
+                self.ui.buy_markers_y.append(open_price)
+                self.ui.tp_line.setPos(self.trader.current_tp_price or open_price * 1.01)
+                self.ui.sl_line.setPos(self.trader.current_sl_price or open_price * 0.99)
+                icon, prob_label = "🚀", "LONG"
+            else:
+                self.ui.sell_markers_x.append(curr_t)
+                self.ui.sell_markers_y.append(open_price)
+                self.ui.tp_line.setPos(self.trader.current_tp_price or open_price * 0.99)
+                self.ui.sl_line.setPos(self.trader.current_sl_price or open_price * 1.01)
+                icon, prob_label = "🩸", "SHORT"
+
+            horizon_s = (curr_ms + self.trader.horizon_ms) / 1_000.0
+            self.ui.horizon_line.setPos(horizon_s)
+            for line in [self.ui.horizon_line, self.ui.tp_line, self.ui.sl_line]:
+                line.show()
+
+            logger.info(f"{icon} ENTERED {prob_label} @ {open_price:.2f} (candle open)")
+            self.notifier.send_message(
+                f"{icon} <b>ENTERED {prob_label} @ {open_price:.2f}</b>\n"
+                f"SL: {self.trader.sl_pct * 100:.2f}%  TP: {self.trader.tp_pct * 100:.2f}%"
+            )
+            self.ui.pending_label.setText("")
+        else:
+            if self.trader.pending_signal:
+                sig = self.trader.pending_signal
+                self.ui.pending_label.setText(
+                    f"⏳ PENDING {sig} — will execute at next candle open"
+                )
 
     def _update_interface(
             self,
@@ -479,27 +593,36 @@ class TopoAlphaEngine(QMainWindow):
             curr_p = prices[-1]
             curr_ms = timestamps[-1]
 
-            self.ui.price_curve.setData(times_sec, prices)
+            candle_display = [
+                [c[0] / 1_000.0, c[1], c[2], c[3], c[4]]
+                for c in self.candles[-200:]
+            ]
+            self.ui.candle_item.setData(candle_display)
+
             self.ui.stress_curve.setData(times_sec, stress_history)
             self.ui.obi_curve.setData(times_sec, obi_history)
 
+            htf_prices = [c[4] for c in self.candles_htf]
             htf_dir = ""
-            if len(self.prices_htf) >= 21:
-                s = pd.Series(self.prices_htf)
-                htf_dir = "📈HTF↑" if s.ewm(span=8).mean().iloc[-1] > s.ewm(span=21).mean().iloc[-1] else "📉HTF↓"
+            if len(htf_prices) >= 21:
+                s = pd.Series(htf_prices)
+                ema8 = s.ewm(span=8, adjust=False).mean().iloc[-1]
+                ema21 = s.ewm(span=21, adjust=False).mean().iloc[-1]
+                htf_dir = "📈HTF↑" if ema8 > ema21 else "📉HTF↓"
 
+            pending_txt = f"  ⏳{self.trader.pending_signal}" if self.trader.pending_signal else ""
             self.ui.signal_label.setText(
                 f"UP: {probs['up']:.1%}  |  FLAT: {probs['flat']:.1%}  |  "
-                f"DOWN: {probs['down']:.1%}   STRESS: {current_stress:.2f}  {htf_dir}"
+                f"DOWN: {probs['down']:.1%}   STRESS: {current_stress:.2f}  "
+                f"{htf_dir}{pending_txt}"
             )
-
-            if curr_ms > self.last_processed_time:
-                self.last_processed_time = curr_ms
 
             res = self.trader.update(curr_p, curr_ms)
             if res:
                 logger.info(
-                    f"CLOSED ({res['reason']})  P&L: ${res['net_profit_usd']:.2f}  Bal: ${self.trader.balance:.2f}")
+                    f"CLOSED ({res['reason']})  P&L: ${res['net_profit_usd']:.2f}  "
+                    f"Bal: ${self.trader.balance:.2f}"
+                )
                 for line in [self.ui.horizon_line, self.ui.sl_line, self.ui.tp_line]:
                     line.hide()
                 icon = "✅" if res["net_profit_usd"] > 0 else "🛑"
@@ -509,6 +632,32 @@ class TopoAlphaEngine(QMainWindow):
                     f"Balance: ${self.trader.balance:.2f}"
                 )
 
+            if (current_stress >= self.alpha_stress_threshold
+                    and self.trader.position is None
+                    and self.trader.pending_signal is None):
+
+                htf_prices_list = [c[4] for c in self.candles_htf]
+                htf_bull = False;
+                htf_bear = False
+                if len(htf_prices_list) >= 21:
+                    s = pd.Series(htf_prices_list)
+                    gap = (s.ewm(span=8).mean().iloc[-1] - s.ewm(span=21).mean().iloc[-1])
+                    gap_pct = gap / (s.iloc[-1] + 1e-10)
+                    htf_bull = gap_pct > 0.001
+                    htf_bear = gap_pct < -0.001
+
+                atr_pct = self._current_atr_pct()
+                if probs["up"] >= self._ENTRY_PROB_THRESHOLD and htf_bull:
+                    self.trader.set_pending("LONG", atr_pct)
+                    self.ui.pending_label.setText(
+                        f"⏳ PENDING LONG — will execute at next candle open"
+                    )
+                elif probs["down"] >= self._ENTRY_PROB_THRESHOLD and htf_bear:
+                    self.trader.set_pending("SHORT", atr_pct)
+                    self.ui.pending_label.setText(
+                        f"⏳ PENDING SHORT — will execute at next candle open"
+                    )
+
             net_pnl = self.trader.get_unrealized_pnl(curr_p)
             color = "#00FF00" if net_pnl >= 0 else "#FF0000"
             self.ui.portfolio_label.setText(
@@ -516,12 +665,6 @@ class TopoAlphaEngine(QMainWindow):
                 f"NET PNL: <font color='{color}'>${net_pnl:.2f}</font>  |  "
                 f"POS: {self.trader.position or 'NONE'}"
             )
-
-            if current_stress >= self.alpha_stress_threshold and not self.trader.position:
-                if probs["up"] >= 0.60:
-                    self._open_trade("LONG", curr_p, curr_ms, curr_t, current_stress, probs["up"])
-                elif probs["down"] >= 0.60:
-                    self._open_trade("SHORT", curr_p, curr_ms, curr_t, current_stress, probs["down"])
 
             self.ui.buy_scatter.setData(self.ui.buy_markers_x, self.ui.buy_markers_y)
             self.ui.sell_scatter.setData(self.ui.sell_markers_x, self.ui.sell_markers_y)
@@ -545,34 +688,29 @@ class TopoAlphaEngine(QMainWindow):
         except Exception as exc:
             logger.error(f"UI update error: {exc}")
 
-    def _open_trade(self, side, price, curr_ms, curr_t, stress, prob) -> None:
-        if not self.trader.execute_trade(side, price, curr_ms):
-            return
+    def _current_atr_pct(self, period: int = 14) -> float:
+        if len(self.candles) < period + 1:
+            return 0.003
+        prices = [c[4] for c in self.candles[-(period + 1):]]
+        arr = np.array(prices, dtype=float)
+        atr = float(np.abs(np.diff(arr)).mean())
+        return atr / (prices[-1] + 1e-10)
 
-        if side == "LONG":
-            self.ui.buy_markers_x.append(curr_t)
-            self.ui.buy_markers_y.append(price)
-            self.ui.tp_line.setPos(price * (1 + self.trader.tp_pct))
-            self.ui.sl_line.setPos(price * (1 - self.trader.sl_pct))
-            icon, prob_label = "🚀", "UP"
-        else:
-            self.ui.sell_markers_x.append(curr_t)
-            self.ui.sell_markers_y.append(price)
-            self.ui.tp_line.setPos(price * (1 - self.trader.tp_pct))
-            self.ui.sl_line.setPos(price * (1 + self.trader.sl_pct))
-            icon, prob_label = "🩸", "DOWN"
+    def _on_threshold_changed(self, value: int) -> None:
+        self.alpha_stress_threshold = value / 10.0
+        self.ui.stress_label.setText(f"STRESS THRESHOLD: {self.alpha_stress_threshold:.1f}")
+        self.ui.stress_threshold_line.setPos(self.alpha_stress_threshold)
 
-        self.ui.horizon_line.setPos(curr_t + self.trader.horizon_ms / 1_000.0)
-        for line in [self.ui.horizon_line, self.ui.tp_line, self.ui.sl_line]:
-            line.show()
-
-        logger.info(f"OPEN {side} @ {price}  Stress: {stress:.2f}  P({prob_label}): {prob:.2f}")
-        self.notifier.send_message(
-            f"{icon} <b>OPEN {side}</b>\n"
-            f"Price: {price}\n"
-            f"Stress: {stress:.2f}\n"
-            f"P({prob_label}): {prob:.1%}"
-        )
+    def _open_calculator(self) -> None:
+        from trade_calculator import TradeCalculatorWindow
+        prices = [c[4] for c in self.candles]
+        htf_px = [c[4] for c in self.candles_htf]
+        if self._calc_window is None:
+            self._calc_window = TradeCalculatorWindow(parent=None)
+        self._calc_window.feed(prices, self.stress_history, self.obi_history,
+                               htf_px, self.ml, self.trader)
+        self._calc_window.show()
+        self._calc_window.raise_()
 
     def closeEvent(self, e) -> None:
         if self.worker:

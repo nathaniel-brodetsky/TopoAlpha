@@ -11,7 +11,6 @@
 #
 # _MIN_SL_TP_BUFFER_PCT = 0.0015
 #
-#
 # class BinanceDemoExecutor:
 #     def __init__(
 #             self,
@@ -43,7 +42,6 @@
 #             logger.error(f"[BINANCE API] Init error: {exc}")
 #
 #     def _get_actual_fill_price(self) -> float | None:
-#         """Return the average entry price of the current open position."""
 #         try:
 #             positions = self.client.futures_position_information(
 #                 symbol=self.symbol, recvWindow=60_000

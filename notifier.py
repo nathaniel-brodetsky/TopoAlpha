@@ -7,13 +7,7 @@ from dotenv import load_dotenv
 load_dotenv()
 logger = logging.getLogger("TopoAlpha.Notifier")
 
-
 class TelegramNotifier:
-    """Sends HTML-formatted trade alerts to a Telegram chat.
-
-    Requires TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in .env.
-    Silently no-ops when credentials are absent.
-    """
 
     def __init__(self):
         self.token = os.getenv("TELEGRAM_BOT_TOKEN")

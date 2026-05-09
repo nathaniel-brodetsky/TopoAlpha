@@ -8,14 +8,7 @@ _TDA_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="tda")
 RIPSER_TIMEOUT_S: float = 4.0
 _DEGENERATE_STD_THRESHOLD: float = 1e-6
 
-
 class TDAAnalyzer:
-    """Topological stress via H1 persistence of a 3-D delay-embedded point cloud.
-
-    Stress = max persistence of loop (H₁) features in the Vietoris–Rips
-    filtration.  High values indicate strong cyclical structure in recent price
-    trajectories — the core entry signal for TopoAlpha.
-    """
 
     def __init__(self, maxdim: int = 1):
         self.maxdim = maxdim

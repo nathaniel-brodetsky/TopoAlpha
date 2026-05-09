@@ -1,19 +1,3 @@
-"""
-trade_calculator.py — TopoAlpha Trade Calculator
-=================================================
-A standalone analysis panel that computes a full trade breakdown:
-entry, SL, TP, position size, expected value and Kelly criterion.
-
-Run standalone:
-    python trade_calculator.py
-
-Or embed inside the main engine (app.py calls this automatically via the ⚡ button):
-    from trade_calculator import TradeCalculatorWindow
-    calc = TradeCalculatorWindow()
-    calc.feed(prices, stress_history, obi_history, prices_htf, ml, trader)
-    calc.show()
-"""
-
 from __future__ import annotations
 
 import sys
@@ -33,13 +17,11 @@ from PyQt5.QtGui import QFont, QTextCursor
 
 logger = logging.getLogger("TopoAlpha.Calculator")
 
-
 def _atr(prices: list, period: int = 14) -> float:
     if len(prices) < period + 1:
         return 0.0
     arr = np.array(prices[-period - 1:], dtype=float)
     return float(np.abs(np.diff(arr)).mean())
-
 
 def _rsi(prices: list, period: int = 14) -> float:
     if len(prices) < period + 1:
@@ -50,9 +32,7 @@ def _rsi(prices: list, period: int = 14) -> float:
     loss = (-delta.clip(max=0)).mean()
     return 100.0 if loss == 0 else 100 - 100 / (1 + gain / loss)
 
-
 def _htf_trend(prices_htf: list) -> tuple[str, float]:
-    """EMA8 vs EMA21 on HTF.  Returns ('BULL'|'BEAR'|'NEUTRAL', strength_pct)."""
     if len(prices_htf) < 21:
         return "NEUTRAL", 0.0
     s = pd.Series(prices_htf, dtype=float)
@@ -63,9 +43,7 @@ def _htf_trend(prices_htf: list) -> tuple[str, float]:
     if diff < -0.05: return "BEAR", abs(diff)
     return "NEUTRAL", abs(diff)
 
-
 def _vol_rank(prices: list, window: int = 50) -> float:
-    """Percentile rank of current 10-bar volatility over the last *window* bars."""
     if len(prices) < window + 1:
         return 0.5
     rets = pd.Series(prices, dtype=float).pct_change().dropna()
@@ -74,11 +52,9 @@ def _vol_rank(prices: list, window: int = 50) -> float:
         return 0.5
     return float((vol_roll <= vol_roll.iloc[-1]).mean())
 
-
 def _bar(value: float, width: int = 20, char: str = "█") -> str:
     filled = round(value * width)
     return char * filled + "░" * (width - filled)
-
 
 class TradeCalculator:
 
@@ -310,7 +286,6 @@ class TradeCalculator:
             "steps": lines,
         }
 
-
 class TradeCalculatorWindow(QMainWindow):
 
     def __init__(self, parent=None):
@@ -529,7 +504,6 @@ class TradeCalculatorWindow(QMainWindow):
         except Exception as exc:
             logger.error(f"Standalone load: {exc}")
             self._status.setText(f"❌  Load failed: {exc}")
-
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
